@@ -242,6 +242,7 @@ function create_openssl_links() {
     # Create symlinks in /usr/local/lib pointing to wherever OpenSSL is installed
     echo_info "Creating OpenSSL symlinks in /usr/local/lib..."
     
+    # Create symlinks for unversioned libraries
     if [ -f "${lib_dir}/libcrypto.dylib" ]; then
         if [ -L "/usr/local/lib/libcrypto.dylib" ]; then
             echo_info "Removing existing libcrypto.dylib symlink"
@@ -264,6 +265,31 @@ function create_openssl_links() {
     else
         echo_warn "libssl.dylib not found in ${lib_dir}"
         return 1
+    fi
+    
+    # Create symlinks for versioned libraries (some binaries require these)
+    # Find versioned libraries (e.g., libcrypto.3.dylib, libssl.3.dylib)
+    local crypto_versioned=$(find "${lib_dir}" -maxdepth 1 -name "libcrypto.*.dylib" -type f | head -n 1)
+    local ssl_versioned=$(find "${lib_dir}" -maxdepth 1 -name "libssl.*.dylib" -type f | head -n 1)
+    
+    if [ -n "$crypto_versioned" ]; then
+        local crypto_version=$(basename "$crypto_versioned")
+        if [ -L "/usr/local/lib/${crypto_version}" ]; then
+            echo_info "Removing existing ${crypto_version} symlink"
+            rm -f "/usr/local/lib/${crypto_version}"
+        fi
+        ln -sf "$crypto_versioned" "/usr/local/lib/${crypto_version}"
+        echo_info "Created symlink: /usr/local/lib/${crypto_version} -> $crypto_versioned"
+    fi
+    
+    if [ -n "$ssl_versioned" ]; then
+        local ssl_version=$(basename "$ssl_versioned")
+        if [ -L "/usr/local/lib/${ssl_version}" ]; then
+            echo_info "Removing existing ${ssl_version} symlink"
+            rm -f "/usr/local/lib/${ssl_version}"
+        fi
+        ln -sf "$ssl_versioned" "/usr/local/lib/${ssl_version}"
+        echo_info "Created symlink: /usr/local/lib/${ssl_version} -> $ssl_versioned"
     fi
     
     return 0
