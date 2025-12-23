@@ -1,0 +1,667 @@
+#!/bin/sh
+##
+## AirConnect Installer for macOS
+## https://github.com/philippe44/AirConnect
+##
+## Standalone installer that downloads latest release and sets up launchd services
+##
+## Usage: sudo bash install-airconnect.sh
+##
+## run direct with 
+## curl -sL https://raw.githubusercontent.com/MacsInSpace/AirCastAirUpnpMacOS.pkg/main/AirCastAirUpnpMacOS/Scripts/postinstall | sudo bash
+
+set -e  # Exit on error
+
+# Configuration
+FALLBACK_VERSION="1.9.3"  # Used if GitHub API is unavailable
+GITHUB_REPO="philippe44/AirConnect"
+GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+TMP_DIR="/tmp/AirConnect"
+BIN_DIR="/usr/local/bin"
+LAUNCH_AGENTS_DIR="/Library/LaunchAgents"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+function echo_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+function echo_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+function echo_error() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+}
+
+function with_backoff {
+  local max_attempts=${ATTEMPTS-5}
+  local timeout=${TIMEOUT-1}
+  local attempt=1
+  local exitCode=0
+
+  while [ $attempt -lt $max_attempts ]
+  do
+    if "$@"
+    then
+      return 0
+    else
+      exitCode=$?
+    fi
+
+    echo_warn "Retrying in $timeout seconds.."
+    sleep $timeout
+    attempt=$(( attempt + 1 ))
+    timeout=$(( timeout * 2 ))
+  done
+
+  if [ $exitCode != 0 ]
+  then
+    echo_error "Failed after $max_attempts attempts: $@"
+  fi
+
+  return $exitCode
+}
+
+#
+# Get latest version and release zip URL from GitHub releases
+#
+function get_latest_release_info() {
+    echo_info "Checking for latest AirConnect version..." >&2
+    
+    # Get latest release info from GitHub API
+    RELEASE_JSON=$(curl -sL "$GITHUB_API")
+    
+    # Extract version
+    LATEST_VERSION=$(echo "$RELEASE_JSON" | grep '"tag_name":' | sed -E 's/.*"tag_name": "([^"]+)".*/\1/' | head -n 1)
+    LATEST_VERSION=${LATEST_VERSION#v}
+    
+    # Find the zip asset (look for browser_download_url ending in .zip)
+    RELEASE_ZIP_URL=$(echo "$RELEASE_JSON" | grep '"browser_download_url".*\.zip"' | sed -E 's/.*"browser_download_url": "([^"]+)".*/\1/' | head -n 1)
+    
+    if [ -z "$LATEST_VERSION" ] || [ "$LATEST_VERSION" = "null" ]; then
+        echo_warn "Could not determine latest version from GitHub API." >&2
+        echo_info "Using fallback version: ${FALLBACK_VERSION}" >&2
+        LATEST_VERSION="$FALLBACK_VERSION"
+        RELEASE_ZIP_URL=""
+    else
+        echo_info "Found latest version: ${LATEST_VERSION}" >&2
+        if [ -n "$RELEASE_ZIP_URL" ]; then
+            echo_info "Found release zip URL" >&2
+        else
+            echo_warn "No release zip asset found, will use source archive" >&2
+        fi
+    fi
+    
+    # Output version and URL (tab-separated for parsing)
+    echo "${LATEST_VERSION}	${RELEASE_ZIP_URL}"
+}
+
+#
+# Check if running as root
+#
+function check_root() {
+    if [ "$(id -u)" != "0" ]; then
+        echo_error "This script must be run as root (use sudo)"
+        exit 1
+    fi
+}
+
+#
+# Get current logged in user and UID
+#
+function get_logged_in_user() {
+    local user=$(/bin/ls -l /dev/console | /usr/bin/awk '{ print $3 }')
+    if [ -z "$user" ]; then
+        echo_warn "Could not determine logged in user, using 'root'"
+        echo "root"
+    else
+        echo "$user"
+    fi
+}
+
+function get_user_uid() {
+    local user=$1
+    local uid=$(id -u "$user" 2>/dev/null)
+    if [ -z "$uid" ]; then
+        echo_warn "Could not determine UID for user $user, using 0"
+        echo "0"
+    else
+        echo "$uid"
+    fi
+}
+
+#
+# Check if Homebrew is installed
+#
+function check_brew() {
+    local brew_path=$(command -v brew 2>/dev/null)
+    if [ -n "$brew_path" ]; then
+        echo_info "Homebrew detected: $brew_path"
+        return 0
+    else
+        return 1
+    fi
+}
+
+#
+# Find OpenSSL installation location
+# Checks both /usr/local/opt/openssl and /opt/homebrew/opt/openssl
+#
+function find_openssl() {
+    local openssl_path=""
+    local arch=$(uname -m)
+    
+    # On Apple Silicon, check /opt/homebrew/opt first
+    # On Intel, check /usr/local/opt first
+    if [ "$arch" = "arm64" ]; then
+        # Check Apple Silicon Mac location (non-versioned first)
+        if [ -d "/opt/homebrew/opt/openssl" ]; then
+            openssl_path="/opt/homebrew/opt/openssl"
+        # Check for versioned directories (e.g., openssl@3)
+        else
+            local arm_versioned=$(find /opt/homebrew/opt -maxdepth 1 -type d -name "openssl@*" 2>/dev/null | head -n 1)
+            if [ -n "$arm_versioned" ] && [ -d "$arm_versioned" ]; then
+                openssl_path="$arm_versioned"
+            fi
+        fi
+        # Fallback to Intel location (for Rosetta or mixed setups)
+        if [ -z "$openssl_path" ] && [ -d "/usr/local/opt/openssl" ]; then
+            openssl_path="/usr/local/opt/openssl"
+        elif [ -z "$openssl_path" ]; then
+            local intel_versioned=$(find /usr/local/opt -maxdepth 1 -type d -name "openssl@*" 2>/dev/null | head -n 1)
+            if [ -n "$intel_versioned" ] && [ -d "$intel_versioned" ]; then
+                openssl_path="$intel_versioned"
+            fi
+        fi
+    else
+        # Check Intel Mac location (non-versioned first)
+        if [ -d "/usr/local/opt/openssl" ]; then
+            openssl_path="/usr/local/opt/openssl"
+        # Check for versioned directories (e.g., openssl@3)
+        else
+            local intel_versioned=$(find /usr/local/opt -maxdepth 1 -type d -name "openssl@*" 2>/dev/null | head -n 1)
+            if [ -n "$intel_versioned" ] && [ -d "$intel_versioned" ]; then
+                openssl_path="$intel_versioned"
+            fi
+        fi
+    fi
+    
+    if [ -n "$openssl_path" ]; then
+        echo "$openssl_path"
+        return 0
+    else
+        return 1
+    fi
+}
+
+#
+# Check if OpenSSL symlinks exist in /usr/local/lib
+#
+function check_openssl_links() {
+    if [ -L "/usr/local/lib/libcrypto.dylib" ] && [ -L "/usr/local/lib/libssl.dylib" ]; then
+        # Verify links are valid
+        if [ -e "/usr/local/lib/libcrypto.dylib" ] && [ -e "/usr/local/lib/libssl.dylib" ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+#
+# Create OpenSSL symlinks in /usr/local/lib
+# Note: Symlinks always go to /usr/local/lib/ regardless of where OpenSSL is installed.
+# On Apple Silicon: /usr/local/lib/libcrypto.dylib -> /opt/homebrew/opt/openssl/lib/libcrypto.dylib
+# On Intel: /usr/local/lib/libcrypto.dylib -> /usr/local/opt/openssl/lib/libcrypto.dylib
+# This is required so the dynamic linker can find the libraries.
+#
+function create_openssl_links() {
+    local openssl_path=$1
+    
+    if [ -z "$openssl_path" ]; then
+        echo_error "OpenSSL path not provided"
+        return 1
+    fi
+    
+    local lib_dir="${openssl_path}/lib"
+    
+    if [ ! -d "$lib_dir" ]; then
+        echo_error "OpenSSL lib directory not found: $lib_dir"
+        return 1
+    fi
+    
+    # Ensure /usr/local/lib exists (required for symlinks regardless of architecture)
+    if [ ! -d "/usr/local/lib" ]; then
+        echo_info "Creating /usr/local/lib directory..."
+        mkdir -p /usr/local/lib
+    fi
+    
+    # Create symlinks in /usr/local/lib pointing to wherever OpenSSL is installed
+    echo_info "Creating OpenSSL symlinks in /usr/local/lib..."
+    
+    if [ -f "${lib_dir}/libcrypto.dylib" ]; then
+        if [ -L "/usr/local/lib/libcrypto.dylib" ]; then
+            echo_info "Removing existing libcrypto.dylib symlink"
+            rm -f /usr/local/lib/libcrypto.dylib
+        fi
+        ln -sf "${lib_dir}/libcrypto.dylib" /usr/local/lib/libcrypto.dylib
+        echo_info "Created symlink: /usr/local/lib/libcrypto.dylib -> ${lib_dir}/libcrypto.dylib"
+    else
+        echo_warn "libcrypto.dylib not found in ${lib_dir}"
+        return 1
+    fi
+    
+    if [ -f "${lib_dir}/libssl.dylib" ]; then
+        if [ -L "/usr/local/lib/libssl.dylib" ]; then
+            echo_info "Removing existing libssl.dylib symlink"
+            rm -f /usr/local/lib/libssl.dylib
+        fi
+        ln -sf "${lib_dir}/libssl.dylib" /usr/local/lib/libssl.dylib
+        echo_info "Created symlink: /usr/local/lib/libssl.dylib -> ${lib_dir}/libssl.dylib"
+    else
+        echo_warn "libssl.dylib not found in ${lib_dir}"
+        return 1
+    fi
+    
+    return 0
+}
+
+#
+# Check OpenSSL availability and setup
+# Returns 0 if OpenSSL is available and ready, 1 otherwise
+#
+function setup_openssl() {
+    echo_info "Checking for OpenSSL..."
+    
+    # Check for Homebrew first - if not installed, skip OpenSSL check
+    if ! check_brew; then
+        echo_info "Homebrew not installed. Will use static binaries (no OpenSSL dependency)."
+        return 1
+    fi
+    
+    # Find OpenSSL installation (only if Homebrew is installed)
+    local openssl_path=$(find_openssl)
+    
+    if [ -z "$openssl_path" ]; then
+        echo_info "OpenSSL not found via Homebrew. Will use static binaries (no OpenSSL dependency)."
+        return 1
+    fi
+    
+    echo_info "Found OpenSSL at: $openssl_path"
+    
+    # Check if symlinks exist
+    if check_openssl_links; then
+        echo_info "OpenSSL symlinks already exist in /usr/local/lib"
+        return 0
+    else
+        echo_info "OpenSSL symlinks not found, creating them..."
+        if create_openssl_links "$openssl_path"; then
+            echo_info "OpenSSL symlinks created successfully"
+            return 0
+        else
+            echo_warn "Failed to create OpenSSL symlinks. Will use static binaries."
+            return 1
+        fi
+    fi
+}
+
+#
+# Create launchd plist files
+#
+function create_plist_files() {
+    echo_info "Creating launchd plist files..."
+    
+    # Create LaunchAgents directory if it doesn't exist
+    if [ ! -d "$LAUNCH_AGENTS_DIR" ]; then
+        mkdir -p "$LAUNCH_AGENTS_DIR"
+        echo_info "Created $LAUNCH_AGENTS_DIR"
+    fi
+    
+    # Create com.aircast.plist
+    cat > "$LAUNCH_AGENTS_DIR/com.aircast.plist" << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.aircast.plist</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/aircast</string>
+		<string>-Z</string>
+		<string>-f</string>
+		<string>/var/log/aircast.log</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+</dict>
+</plist>
+EOF
+    
+    # Create com.airupnp.plist
+    cat > "$LAUNCH_AGENTS_DIR/com.airupnp.plist" << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.airupnp.plist</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/airupnp</string>
+		<string>-Z</string>
+		<string>-f</string>
+		<string>/var/log/airupnp.log</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+</dict>
+</plist>
+EOF
+    
+    # Set proper ownership
+    chown root:wheel "$LAUNCH_AGENTS_DIR/com.aircast.plist"
+    chown root:wheel "$LAUNCH_AGENTS_DIR/com.airupnp.plist"
+    chmod 644 "$LAUNCH_AGENTS_DIR/com.aircast.plist"
+    chmod 644 "$LAUNCH_AGENTS_DIR/com.airupnp.plist"
+    
+    echo_info "Plist files created successfully"
+}
+
+#
+# Main installation process
+#
+function main() {
+    echo_info "AirConnect Installer for macOS"
+    echo_info "=============================="
+    echo ""
+    
+    # Check if running as root
+    check_root
+    
+    # Get logged in user and UID
+    loggedInUser=$(get_logged_in_user)
+    userUID=$(get_user_uid "$loggedInUser")
+    echo_info "Detected user: $loggedInUser (UID: $userUID)"
+    
+    #
+    # Create TMP_DIR if it doesn't exist
+    #
+    echo_info "Checking for ${TMP_DIR} folder..."
+    if [ ! -d "$TMP_DIR" ]; then
+        echo_info "Creating ${TMP_DIR} folder..."
+        mkdir -p -m 775 "$TMP_DIR"
+        echo_info "Created ${TMP_DIR}"
+    fi
+    
+    #
+    # Stop services if they exist (handle both old and new naming)
+    #
+    echo_info "Stopping services if loaded..."
+    # Use new launchctl bootout command
+    sudo -u "$loggedInUser" launchctl bootout "gui/$userUID/com.aircast.plist" 2>/dev/null || true
+    sudo -u "$loggedInUser" launchctl bootout "gui/$userUID/com.airupnp.plist" 2>/dev/null || true
+    # Also bootout old naming for upgrades
+    sudo -u "$loggedInUser" launchctl bootout "gui/$userUID/com.aircast-osx-multi.plist" 2>/dev/null || true
+    sudo -u "$loggedInUser" launchctl bootout "gui/$userUID/com.airupnp-osx-multi.plist" 2>/dev/null || true
+    echo_info "Services stopped (if they were running)."
+    
+    #
+    # Check for OpenSSL and setup if available
+    #
+    USE_STATIC=true
+    if setup_openssl; then
+        USE_STATIC=false
+        echo_info "OpenSSL is available. Will use dynamic binaries (recommended)."
+    else
+        echo_info "OpenSSL not available or setup failed. Will use static binaries."
+    fi
+    
+    #
+    # Detect macOS architecture and select appropriate binaries
+    #
+    ARCH=$(uname -m)
+    if [ "$ARCH" = "arm64" ]; then
+        if [ "$USE_STATIC" = "true" ]; then
+            AIRCAST_EXE="aircast-macos-arm64-static"
+            AIRUPNP_EXE="airupnp-macos-arm64-static"
+        else
+            AIRCAST_EXE="aircast-macos-arm64"
+            AIRUPNP_EXE="airupnp-macos-arm64"
+        fi
+        echo_info "Detected Apple Silicon (ARM64) architecture."
+    elif [ "$ARCH" = "x86_64" ]; then
+        if [ "$USE_STATIC" = "true" ]; then
+            AIRCAST_EXE="aircast-macos-x86_64-static"
+            AIRUPNP_EXE="airupnp-macos-x86_64-static"
+        else
+            AIRCAST_EXE="aircast-macos-x86_64"
+            AIRUPNP_EXE="airupnp-macos-x86_64"
+        fi
+        echo_info "Detected Intel (x86_64) architecture."
+    else
+        # Fallback to universal macOS binary
+        if [ "$USE_STATIC" = "true" ]; then
+            AIRCAST_EXE="aircast-macos-static"
+            AIRUPNP_EXE="airupnp-macos-static"
+        else
+            AIRCAST_EXE="aircast-macos"
+            AIRUPNP_EXE="airupnp-macos"
+        fi
+        echo_warn "Detected unknown architecture ($ARCH), using universal macOS binary."
+    fi
+    
+    #
+    # Create /usr/local/bin if it doesn't exist
+    #
+    echo_info "Checking for ${BIN_DIR} folder..."
+    if [ ! -d "$BIN_DIR" ]; then
+        echo_info "Creating ${BIN_DIR} folder..."
+        mkdir -p -m 775 "$BIN_DIR"
+        echo_info "Created ${BIN_DIR}"
+    fi
+
+    #
+    # Get latest version and release zip URL
+    #
+    RELEASE_INFO=$(get_latest_release_info)
+    VERSION=$(echo "$RELEASE_INFO" | cut -f1)
+    RELEASE_ZIP_URL=$(echo "$RELEASE_INFO" | cut -f2)
+    
+    # If no release zip URL found, fall back to source archive
+    if [ -z "$RELEASE_ZIP_URL" ]; then
+        ZIP_URL="https://github.com/${GITHUB_REPO}/archive/refs/tags/${VERSION}.zip"
+        echo_info "Using source archive URL (no release assets found)"
+    else
+        ZIP_URL="$RELEASE_ZIP_URL"
+        echo_info "Using release assets URL"
+    fi
+    
+    ZIP_FILE="${TMP_DIR}/AirConnect-${VERSION}.zip"
+    EXTRACT_DIR="${TMP_DIR}/AirConnect-${VERSION}"
+    
+    #
+    # Download latest release zip
+    #
+    echo_info "Downloading AirConnect ${VERSION} from GitHub releases..."
+    
+    cd "$TMP_DIR" || exit 1
+    
+    # Clean up any existing download/extraction
+    rm -f "$ZIP_FILE"
+    rm -rf "$EXTRACT_DIR"
+    
+    if ! with_backoff curl -L -o "$ZIP_FILE" "$ZIP_URL"; then
+        echo_error "Failed to download AirConnect release zip."
+        exit 1
+    fi
+    
+    echo_info "Download complete."
+    
+    #
+    # Extract the zip file
+    #
+    echo_info "Extracting AirConnect ${VERSION}..."
+    if ! unzip -o -q "$ZIP_FILE" -d "$TMP_DIR"; then
+        echo_error "Failed to extract zip file."
+		rm -rf "$TMP_DIR"
+        exit 1
+    fi
+    
+    echo_info "Extraction complete."
+    
+    #
+    # Check if there's a nested zip file (source archive contains another zip)
+    #
+    NESTED_ZIP=$(find "$TMP_DIR" -maxdepth 2 -name "*.zip" -type f ! -name "AirConnect-*.zip" | head -n 1)
+    if [ -n "$NESTED_ZIP" ]; then
+        echo_info "Found nested zip file, extracting: $NESTED_ZIP"
+        if ! unzip -o -q "$NESTED_ZIP" -d "$TMP_DIR"; then
+            echo_error "Failed to extract nested zip file."
+			rm -rf "$TMP_DIR"
+            exit 1
+        fi
+        echo_info "Nested zip extracted."
+    fi
+    
+    #
+    # Find the actual extracted directory or check if executables are directly in tmp
+    # Release zip extracts directly to temp dir, source archive creates AirConnect-* subdirectory
+    #
+    EXTRACTED_DIR=$(find "$TMP_DIR" -maxdepth 1 -type d -name "AirConnect-*" | head -n 1)
+    
+    # If no AirConnect-* directory found, check if executables are directly in tmp (from release zip)
+    if [ -z "$EXTRACTED_DIR" ]; then
+        # Check if any macOS executables exist directly in TMP_DIR (release zip structure)
+        # Use find to search for the specific executables we need
+        MACOS_AIRCAST=$(find "$TMP_DIR" -maxdepth 1 -type f -name "$AIRCAST_EXE" | head -n 1)
+        MACOS_AIRUPNP=$(find "$TMP_DIR" -maxdepth 1 -type f -name "$AIRUPNP_EXE" | head -n 1)
+        
+        if [ -n "$MACOS_AIRCAST" ] || [ -n "$MACOS_AIRUPNP" ]; then
+            EXTRACTED_DIR="$TMP_DIR"
+            echo_info "Executables found directly in temp directory (release zip structure)"
+        else
+            # Check for any macOS executables as fallback
+            if find "$TMP_DIR" -maxdepth 1 -type f \( -name "aircast-macos*" -o -name "airupnp-macos*" \) | grep -q .; then
+                EXTRACTED_DIR="$TMP_DIR"
+                echo_info "Executables found directly in temp directory (release zip structure)"
+            else
+                echo_error "Could not find extracted AirConnect directory or macOS executables in $TMP_DIR"
+                echo_info "Looking for: $AIRCAST_EXE and $AIRUPNP_EXE"
+                echo_info "Contents of $TMP_DIR (showing aircast/airupnp files only):"
+                ls -la "$TMP_DIR" | grep -E "(aircast|airupnp)" | head -30
+                echo_info "Total files in $TMP_DIR:"
+                ls -1 "$TMP_DIR" | wc -l
+				rm -rf "$TMP_DIR"
+                exit 1
+            fi
+        fi
+    else
+        echo_info "Found extracted directory: $EXTRACTED_DIR"
+    fi
+    
+    #
+    # Find executables (they may be in subdirectories)
+    #
+    AIRCAST_SRC=$(find "$EXTRACTED_DIR" -type f -name "$AIRCAST_EXE" | head -n 1)
+    AIRUPNP_SRC=$(find "$EXTRACTED_DIR" -type f -name "$AIRUPNP_EXE" | head -n 1)
+    
+    if [ -z "$AIRCAST_SRC" ] || [ ! -f "$AIRCAST_SRC" ]; then
+        echo_error "Executable not found: ${AIRCAST_EXE}"
+        echo_info "Searching for executables in: $EXTRACTED_DIR"
+        echo_info "Available files in extracted directory:"
+        ls -la "$EXTRACTED_DIR" | head -20
+        echo_info "Searching recursively for aircast files:"
+        find "$EXTRACTED_DIR" -type f -name "*aircast*" | head -10
+		rm -rf "$TMP_DIR"
+        exit 1
+    fi
+    
+    if [ -z "$AIRUPNP_SRC" ] || [ ! -f "$AIRUPNP_SRC" ]; then
+        echo_error "Executable not found: ${AIRUPNP_EXE}"
+        echo_info "Searching for executables in: $EXTRACTED_DIR"
+        echo_info "Available files in extracted directory:"
+        ls -la "$EXTRACTED_DIR" | head -20
+        echo_info "Searching recursively for airupnp files:"
+        find "$EXTRACTED_DIR" -type f -name "*airupnp*" | head -10
+		rm -rf "$TMP_DIR"
+        exit 1
+    fi
+    
+    echo_info "Found aircast executable: $AIRCAST_SRC"
+    echo_info "Found airupnp executable: $AIRUPNP_SRC"
+    
+    echo_info "Copying executables to ${BIN_DIR}..."
+    if ! cp "$AIRCAST_SRC" "${BIN_DIR}/aircast" || ! cp "$AIRUPNP_SRC" "${BIN_DIR}/airupnp"; then
+        echo_error "Failed to copy executables."
+        rm -rf "$TMP_DIR"
+        exit 1
+    fi
+    
+    echo_info "Executables copied successfully."
+    
+    #
+    # Set executable permissions
+    #
+    echo_info "Setting executable permissions..."
+    /bin/chmod +x "${BIN_DIR}/aircast"
+    /bin/chmod +x "${BIN_DIR}/airupnp"
+    echo_info "Permissions set."
+    
+    #
+    # Clean up downloaded files
+    #
+    echo_info "Cleaning up temporary files..."
+	rm -rf "$TMP_DIR"
+	echo_info "Cleanup complete."
+    
+    #
+    # Create log files and set permissions
+    #
+    echo_info "Setting up log files..."
+    if [ ! -f "/var/log/aircast.log" ]; then
+        touch /var/log/aircast.log
+        chmod 755 /var/log/aircast.log
+    fi
+    
+    if [ ! -f "/var/log/airupnp.log" ]; then
+        touch /var/log/airupnp.log
+        chmod 755 /var/log/airupnp.log
+    fi
+    
+    echo "START OF NEW INSTALL LOG - $(date)" >> /var/log/aircast.log
+    echo "START OF NEW INSTALL LOG - $(date)" >> /var/log/airupnp.log
+    
+    #
+    # Create plist files
+    #
+    create_plist_files
+    
+    #
+    # Start services
+    #
+    echo_info "Starting services..."
+    # Use new launchctl bootstrap command
+    sudo -u "$loggedInUser" launchctl bootstrap "gui/$userUID" "$LAUNCH_AGENTS_DIR/com.aircast.plist" 2>/dev/null || true
+    sudo -u "$loggedInUser" launchctl bootstrap "gui/$userUID" "$LAUNCH_AGENTS_DIR/com.airupnp.plist" 2>/dev/null || true
+    echo_info "Services started."
+    
+    echo ""
+    echo_info "Installation complete!"
+    echo_info "AirConnect version ${VERSION} has been installed and started."
+    echo_info "Logs are available at: /var/log/aircast.log and /var/log/airupnp.log"
+}
+
+# Run main function
+main
+
+exit 0
+
