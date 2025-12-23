@@ -27,7 +27,8 @@ class AirconnectInstaller < Formula
     puts ""
     
     # Run the installer with sudo (will prompt for password)
-    unless system "sudo", "#{bin}/airconnect-install"
+    installer_path = bin/"airconnect-install"
+    unless system "sudo", installer_path.to_s
       opoo "AirConnect installation was cancelled or failed."
       puts ""
       puts "You can run the installer manually later with:"
