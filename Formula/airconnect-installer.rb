@@ -11,7 +11,7 @@ class AirconnectInstaller < Formula
   version "1.0.0"
   # TODO: Calculate SHA256 after creating the release tag:
   # curl -L https://github.com/MacsInSpace/AirConnectInstaller/archive/refs/tags/v1.0.0.tar.gz | shasum -a 256
-  sha256 "" # Update this after creating v1.0.0 tag
+  sha256 "0d32e66edaf686de3bd3f7386fcf23a3fc4d5ad40a8b3cb85dd5ba07228c80a4" # Update this after creating v1.0.0 tag
   license "MIT"
 
   def install
