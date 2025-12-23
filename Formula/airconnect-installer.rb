@@ -21,6 +21,21 @@ class AirconnectInstaller < Formula
     chmod 0755, bin/"airconnect-install"
   end
 
+  def post_install
+    ohai "AirConnect installer requires root privileges to install AirConnect."
+    ohai "You will be prompted for your password to continue."
+    puts ""
+    
+    # Run the installer with sudo (will prompt for password)
+    unless system "sudo", "#{bin}/airconnect-install"
+      opoo "AirConnect installation was cancelled or failed."
+      puts ""
+      puts "You can run the installer manually later with:"
+      puts "  sudo airconnect-install"
+      puts ""
+    end
+  end
+
   test do
     # Test that the script exists and is executable
     assert_predicate bin/"airconnect-install", :exist?
@@ -31,9 +46,9 @@ class AirconnectInstaller < Formula
 
   def caveats
     <<~EOS
-      This installer requires root privileges to install AirConnect.
+      AirConnect installer has been installed to your system.
       
-      To install AirConnect, run:
+      If installation was cancelled, you can run it manually with:
         sudo airconnect-install
       
       The installer will:
