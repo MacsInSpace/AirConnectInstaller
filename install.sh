@@ -7,8 +7,7 @@
 ##
 ## Usage: sudo bash install-airconnect.sh
 ##
-## run direct with 
-## curl -sL https://raw.githubusercontent.com/MacsInSpace/AirCastAirUpnpMacOS.pkg/main/AirCastAirUpnpMacOS/Scripts/postinstall | sudo bash
+## run direct with  curl -sL https://raw.githubusercontent.com/MacsInSpace/AirConnectInstaller/main/install.sh | sudo bash
 
 set -e  # Exit on error
 
